@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">هتوصل يا نجم</string>
+    <string name="title_activity_main">هتوصل يا نجم</string>
+    <string name="package_name">com.hatwisel.yanegm</string>
+    <string name="custom_url_scheme">com.hatwisel.yanegm</string>
+</resources>

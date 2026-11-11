@@ -1,0 +1,30 @@
+{
+  "template": "bolt-vite-react-ts",
+  "app_status": "production",
+  "clear_demo_data": true,
+  "reset_wallets_to_zero": true,
+  "monetization": {
+    "commission": {
+      "enabled": true,
+      "percentage_per_trip": 15.0,
+      "currency": "LOCAL"
+    },
+    "google_admob": {
+      "enabled": true,
+      "app_id": "ca-app-pub-XXXXXXXXXXXXXXXX~XXXXXXXXXXXXXXXX",
+      "banner_unit_id": "ca-app-pub-XXXXXXXXXXXXXXXX/XXXXXXXXXXXXXXXX",
+      "interstitial_unit_id": "ca-app-pub-XXXXXXXXXXXXXXXX/XXXXXXXXXXXXXXXX"
+    },
+    "driver_subscriptions": {
+      "enabled": true,
+      "plans": [
+        {
+          "plan_name": "Premium Monthly Driver",
+          "price": 200,
+          "duration_days": 30,
+          "trip_commission_percent": 0
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,2 @@
+[functions.admin-send-code]
+verify_jwt = false
