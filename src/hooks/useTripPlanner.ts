@@ -116,6 +116,15 @@ export function useTripPlanner({
     }
   };
 
+  const setPointFromSuggestion = (target: 'pickup' | 'dropoff', suggestion: { displayName: string; lat: number; lng: number }) => {
+    const point: LatLng = { lat: suggestion.lat, lng: suggestion.lng };
+    if (target === 'pickup') {
+      pickup.setPointFromMap(point, suggestion.displayName);
+    } else {
+      dropoff.setPointFromMap(point, suggestion.displayName);
+    }
+  };
+
   return {
     pickupPoint: pickup.point,
     dropoffPoint: dropoff.point,
@@ -126,5 +135,6 @@ export function useTripPlanner({
     pickMode,
     setPickMode,
     handleMapPick,
+    setPointFromSuggestion,
   };
 }

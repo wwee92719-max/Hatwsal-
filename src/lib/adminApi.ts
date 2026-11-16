@@ -273,9 +273,40 @@ export async function listAdmins(): Promise<AdminUser[]> {
   }));
 }
 
-export async function addAdmin(email: string): Promise<void> {
-  const { error } = await supabase.rpc('admin_add_admin', { p_email: email });
+const MANAGE_AUTH_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin-manage-auth`;
+
+export async function addAdmin(email: string, password: string): Promise<void> {
+  const { error } = await supabase.rpc('admin_add_admin_with_password', {
+    p_email: email,
+    p_password: password,
+  });
   if (error) throw error;
+
+  const { data: sessionData } = await supabase.auth.getSession();
+  const response = await fetch(MANAGE_AUTH_URL, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${sessionData.session?.access_token ?? ''}`,
+      apikey: import.meta.env.VITE_SUPABASE_ANON_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ action: 'create', email, password }),
+  });
+  if (!response.ok) {
+    const body = (await response.json().catch(() => null)) as { error?: string; detail?: string } | null;
+    throw new Error(body?.detail ?? body?.error ?? 'auth_create_failed');
+  }
+}
+
+export async function signInAdmin(email: string, password: string): Promise<{ ok: boolean; error?: string }> {
+  const { error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) return { ok: false, error: error.message };
+  const admin = await isCurrentUserAdmin();
+  if (!admin) {
+    await supabase.auth.signOut();
+    return { ok: false, error: 'not_admin' };
+  }
+  return { ok: true };
 }
 
 export async function removeAdmin(adminId: string): Promise<void> {
@@ -289,38 +320,5 @@ export async function isCurrentUserAdmin(): Promise<boolean> {
   return data === true;
 }
 
-export type AdminCodeRequestResult = 'sent' | 'not_added' | 'invalid' | 'rate_limited' | 'failed';
 
-const ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
-const SEND_CODE_URL = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/admin-send-code`;
-
-export async function requestAdminCode(email: string): Promise<AdminCodeRequestResult> {
-  try {
-    const response = await fetch(SEND_CODE_URL, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${ANON_KEY}`,
-        apikey: ANON_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ email }),
-    });
-    const body = (await response.json().catch(() => null)) as { ok?: boolean; error?: string } | null;
-    if (response.ok && body?.ok === true) return 'sent';
-    if (body?.error === 'not_added') return 'not_added';
-    if (body?.error === 'invalid_email') return 'invalid';
-    if (body?.error === 'rate_limited') return 'rate_limited';
-    return 'failed';
-  } catch {
-    return 'failed';
-  }
-}
-
-export async function verifyAdminCode(email: string, code: string): Promise<boolean> {
-  const { error } = await supabase.auth.verifyOtp({ email, token: code, type: 'email' });
-  if (error) return false;
-  const admin = await isCurrentUserAdmin();
-  if (!admin) await supabase.auth.signOut();
-  return admin;
-}
 

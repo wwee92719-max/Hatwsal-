@@ -1,9 +1,9 @@
 {
   "projectId": "72845398",
   "functions": {
-    "admin-send-code": {
+    "admin-manage-auth": {
       "hasChanged": false,
-      "hash": "c86df20f587a5cf3f9d37f79d8c019bffc70901ef60044d9008bd283045c3f4f"
+      "hash": "7ccbfe48b04ea4a4dd332d7a786ae1adae22d1a23ad4d4ae0cb265e5114fcfa7"
     }
   }
 }

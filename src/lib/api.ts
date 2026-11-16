@@ -16,6 +16,9 @@ export type Driver = {
   idFrontPath: string | null;
   idBackPath: string | null;
   subscriptionExpiresAt: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  isOnline: boolean;
 };
 
 export type WalletTransaction = {
@@ -39,8 +42,14 @@ export type Trip = {
   pickup: string;
   dropoff: string;
   finalFare: number | null;
-  status: 'active' | 'completed';
+  status: 'pending' | 'active' | 'completed' | 'cancelled';
   createdAt: string;
+  pickupLat: number | null;
+  pickupLng: number | null;
+  suggestedFare: number | null;
+  distanceKm: number | null;
+  clientOffer: number;
+  vehicleType: string | null;
 };
 
 export type CompletedTripSummary = {
@@ -68,6 +77,9 @@ type DriverRow = {
   id_front_path: string | null;
   id_back_path: string | null;
   subscription_expires_at: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  is_online: boolean;
 };
 
 type WalletTransactionRow = {
@@ -91,12 +103,18 @@ type TripRow = {
   pickup: string;
   dropoff: string;
   final_fare: number | string | null;
-  status: 'active' | 'completed';
+  status: 'pending' | 'active' | 'completed' | 'cancelled';
   created_at: string;
+  pickup_lat: number | null;
+  pickup_lng: number | null;
+  suggested_fare: number | string | null;
+  distance_km: number | string | null;
+  client_offer: number | string;
+  vehicle_type: string | null;
 };
 
-const DRIVER_COLUMNS = 'id, name, phone, address, vehicle_type, status, wallet_balance, created_at, id_front_path, id_back_path, subscription_expires_at';
-const TRIP_COLUMNS = 'id, driver_id, client_name, client_phone, province, city, pickup, dropoff, final_fare, status, created_at';
+const DRIVER_COLUMNS = 'id, name, phone, address, vehicle_type, status, wallet_balance, created_at, id_front_path, id_back_path, subscription_expires_at, latitude, longitude, is_online';
+const TRIP_COLUMNS = 'id, driver_id, client_name, client_phone, province, city, pickup, dropoff, final_fare, status, created_at, pickup_lat, pickup_lng, suggested_fare, distance_km, client_offer, vehicle_type';
 
 export const toNumber = (value: number | string | null) => (value === null ? 0 : Number(value));
 
@@ -112,6 +130,9 @@ const toDriver = (row: DriverRow): Driver => ({
   idFrontPath: row.id_front_path ?? null,
   idBackPath: row.id_back_path ?? null,
   subscriptionExpiresAt: row.subscription_expires_at,
+  latitude: row.latitude ?? null,
+  longitude: row.longitude ?? null,
+  isOnline: row.is_online ?? false,
 });
 
 export function hasActiveSubscription(driver: Pick<Driver, 'subscriptionExpiresAt'>): boolean {
@@ -130,6 +151,12 @@ const toTrip = (row: TripRow): Trip => ({
   finalFare: row.final_fare === null ? null : Number(row.final_fare),
   status: row.status,
   createdAt: row.created_at,
+  pickupLat: row.pickup_lat ?? null,
+  pickupLng: row.pickup_lng ?? null,
+  suggestedFare: row.suggested_fare === null ? null : Number(row.suggested_fare),
+  distanceKm: row.distance_km === null ? null : Number(row.distance_km),
+  clientOffer: toNumber(row.client_offer),
+  vehicleType: row.vehicle_type ?? null,
 });
 
 const toWalletTransaction = (row: WalletTransactionRow): WalletTransaction => ({
@@ -273,6 +300,215 @@ export async function createTrip(input: {
     final_fare: input.finalFare,
   });
   if (error) throw error;
+}
+
+// --- Real-time ride dispatch ---
+
+export async function createPendingTrip(input: {
+  clientName: string;
+  clientPhone: string;
+  province: string;
+  city: string;
+  pickup: string;
+  dropoff: string;
+  distanceKm: number | null;
+  clientOffer: number;
+  suggestedFare: number | null;
+  pickupLat: number | null;
+  pickupLng: number | null;
+  vehicleType: string;
+}): Promise<string> {
+  const { data, error } = await supabase.from('trips').insert({
+    client_name: input.clientName,
+    client_phone: input.clientPhone,
+    province: input.province,
+    city: input.city,
+    pickup: input.pickup,
+    dropoff: input.dropoff,
+    distance_km: input.distanceKm,
+    client_offer: input.clientOffer,
+    suggested_fare: input.suggestedFare,
+    pickup_lat: input.pickupLat,
+    pickup_lng: input.pickupLng,
+    vehicle_type: input.vehicleType,
+    status: 'pending',
+  }).select('id').single();
+  if (error) {
+    console.error('[createPendingTrip] Supabase insert failed:', {
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      hint: error.hint,
+      input,
+    });
+    throw error;
+  }
+  return data.id;
+}
+
+export async function cancelPendingTrip(tripId: string): Promise<void> {
+  const { error } = await supabase
+    .from('trips')
+    .update({ status: 'cancelled' })
+    .eq('id', tripId)
+    .eq('status', 'pending');
+  if (error) throw error;
+}
+
+export async function acceptBidAndAssignDriver(tripId: string, bidId: string, driverId: string, finalFare: number): Promise<void> {
+  const { error: bidError } = await supabase
+    .from('ride_bids')
+    .update({ status: 'accepted' })
+    .eq('id', bidId);
+  if (bidError) throw bidError;
+
+  const { error: rejectError } = await supabase
+    .from('ride_bids')
+    .update({ status: 'rejected' })
+    .eq('trip_id', tripId)
+    .neq('id', bidId)
+    .eq('status', 'pending');
+  if (rejectError) throw rejectError;
+
+  const { error: tripError } = await supabase
+    .from('trips')
+    .update({ status: 'active', driver_id: driverId, final_fare: finalFare })
+    .eq('id', tripId)
+    .eq('status', 'pending');
+  if (tripError) throw tripError;
+}
+
+export async function getTripById(tripId: string): Promise<Trip | null> {
+  const { data, error } = await supabase
+    .from('trips')
+    .select(TRIP_COLUMNS)
+    .eq('id', tripId)
+    .maybeSingle();
+  if (error) throw error;
+  return data ? toTrip(data as TripRow) : null;
+}
+
+export async function updateDriverLocation(driverId: string, lat: number, lng: number): Promise<void> {
+  const { error } = await supabase
+    .from('drivers')
+    .update({ latitude: lat, longitude: lng })
+    .eq('id', driverId);
+  if (error) throw error;
+}
+
+export async function setDriverOnline(driverId: string, online: boolean): Promise<void> {
+  const { error } = await supabase
+    .from('drivers')
+    .update({ is_online: online })
+    .eq('id', driverId);
+  if (error) throw error;
+}
+
+// --- Ride bids ---
+
+export type RideBid = {
+  id: string;
+  tripId: string;
+  driverId: string;
+  driverName: string;
+  vehicleType: string;
+  offerAmount: number;
+  status: 'pending' | 'accepted' | 'rejected';
+  createdAt: string;
+};
+
+type RideBidRow = {
+  id: string;
+  trip_id: string;
+  driver_id: string;
+  offer_amount: number | string;
+  status: 'pending' | 'accepted' | 'rejected';
+  created_at: string;
+  drivers: { name: string; vehicle_type: string } | null;
+};
+
+const toRideBid = (row: RideBidRow): RideBid => ({
+  id: row.id,
+  tripId: row.trip_id,
+  driverId: row.driver_id,
+  driverName: row.drivers?.name ?? '-',
+  vehicleType: row.drivers?.vehicle_type ?? '-',
+  offerAmount: toNumber(row.offer_amount),
+  status: row.status,
+  createdAt: row.created_at,
+});
+
+export async function submitBid(tripId: string, driverId: string, offerAmount: number): Promise<void> {
+  const { error } = await supabase.from('ride_bids').upsert({
+    trip_id: tripId,
+    driver_id: driverId,
+    offer_amount: offerAmount,
+    status: 'pending',
+  }, { onConflict: 'trip_id,driver_id' });
+  if (error) throw error;
+}
+
+export async function listBidsForTrip(tripId: string): Promise<RideBid[]> {
+  const { data, error } = await supabase
+    .from('ride_bids')
+    .select('id, trip_id, driver_id, offer_amount, status, created_at, drivers(name, vehicle_type)')
+    .eq('trip_id', tripId)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return ((data ?? []) as unknown as RideBidRow[]).map(toRideBid);
+}
+
+export type NearbyDriver = {
+  driverId: string;
+  driverName: string;
+  vehicleType: string;
+  latitude: number;
+  longitude: number;
+  distanceKm: number;
+};
+
+export async function listNearbyOnlineDrivers(pickupLat: number, pickupLng: number, radiusKm: number = 5): Promise<NearbyDriver[]> {
+  const { data, error } = await supabase.rpc('nearby_online_drivers', {
+    p_pickup_lat: pickupLat,
+    p_pickup_lng: pickupLng,
+    p_radius_km: radiusKm,
+  });
+  if (error) throw error;
+  return ((data ?? []) as { driver_id: string; driver_name: string; vehicle_type: string; latitude: number; longitude: number; distance_km: number }[]).map((row) => ({
+    driverId: row.driver_id,
+    driverName: row.driver_name,
+    vehicleType: row.vehicle_type,
+    latitude: row.latitude,
+    longitude: row.longitude,
+    distanceKm: row.distance_km,
+  }));
+}
+
+export async function listPendingTripsForDriver(driverId: string): Promise<Trip[]> {
+  const { data: nearby, error: nearbyError } = await supabase.rpc('nearby_online_drivers', {
+    p_pickup_lat: 0,
+    p_pickup_lng: 0,
+    p_radius_km: 999999,
+  });
+  if (nearbyError) throw nearbyError;
+  const isNearby = (nearby ?? []).some((d: { driver_id: string }) => d.driver_id === driverId);
+  if (!isNearby) return [];
+
+  const { data, error } = await supabase
+    .from('trips')
+    .select(TRIP_COLUMNS)
+    .eq('status', 'pending')
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+
+  const allPending = ((data ?? []) as TripRow[]).map(toTrip);
+  return allPending.filter((trip) => {
+    if (trip.pickupLat === null || trip.pickupLng === null) return false;
+    const nearbyRow = (nearby as { driver_id: string; distance_km: number }[]).find((d) => d.driver_id === driverId);
+    if (!nearbyRow) return false;
+    return nearbyRow.distance_km <= 5;
+  });
 }
 
 export async function listActiveTripsForDriver(driverId: string): Promise<Trip[]> {

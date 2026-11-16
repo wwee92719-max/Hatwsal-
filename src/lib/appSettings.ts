@@ -2,6 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { DEFAULT_PRICING, type PricingSettings } from '@/lib/pricing';
 
 export const SUBSCRIPTION_PRICE_DEFAULT = 300;
+export const REQUIRED_MIN_BALANCE_DEFAULT = 300;
 
 export async function getPricingSettings(): Promise<PricingSettings> {
   const { data, error } = await supabase.from('app_settings').select('key, value').in('key', [
@@ -47,5 +48,22 @@ export async function saveSubscriptionPrice(price: number): Promise<void> {
   const { error } = await supabase
     .from('app_settings')
     .upsert({ key: 'subscription_price', value: String(price), updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
+}
+
+export async function getRequiredMinBalance(): Promise<number> {
+  const { data, error } = await supabase
+    .from('app_settings')
+    .select('value')
+    .eq('key', 'required_min_balance')
+    .maybeSingle();
+  if (error) throw error;
+  return parseFloat(data?.value ?? '') || REQUIRED_MIN_BALANCE_DEFAULT;
+}
+
+export async function saveRequiredMinBalance(amount: number): Promise<void> {
+  const { error } = await supabase
+    .from('app_settings')
+    .upsert({ key: 'required_min_balance', value: String(amount), updated_at: new Date().toISOString() }, { onConflict: 'key' });
   if (error) throw error;
 }

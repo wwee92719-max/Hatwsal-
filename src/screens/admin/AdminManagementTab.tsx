@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { Mail, Plus, ShieldCheck, Trash2 } from 'lucide-react';
+import { KeyRound, Mail, Plus, ShieldCheck, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { TextField } from '@/components/ui/TextField';
 import { useAdminSession } from '@/context/AdminSessionContext';
@@ -13,6 +13,7 @@ export function AdminManagementTab() {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState(false);
   const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [formError, setFormError] = useState('');
   const [listError, setListError] = useState('');
   const [busy, setBusy] = useState(false);
@@ -40,11 +41,16 @@ export function AdminManagementTab() {
       setFormError('يرجى كتابة بريد إلكتروني صحيح');
       return;
     }
+    if (password.length < 8) {
+      setFormError('كلمة المرور يجب أن تكون 8 أحرف على الأقل');
+      return;
+    }
     setBusy(true);
     setFormError('');
     try {
-      await addAdmin(normalized);
+      await addAdmin(normalized, password);
       setEmail('');
+      setPassword('');
       await reload();
     } catch (err) {
       setFormError(getApiErrorMessage(err, 'تعذر إضافة المدير'));
@@ -85,8 +91,18 @@ export function AdminManagementTab() {
           value={email}
           onChange={(e) => setEmail(e.target.value)}
         />
+        <TextField
+          label="كلمة المرور"
+          dir="ltr"
+          type="password"
+          autoComplete="new-password"
+          placeholder="••••••••"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          icon={<KeyRound size={18} />}
+        />
         {formError && <p className="rounded-lg bg-error-50 p-2.5 text-sm text-error-600">{formError}</p>}
-        <Button type="submit" variant="primary" size="md" fullWidth disabled={busy || email.trim() === ''}>
+        <Button type="submit" variant="primary" size="md" fullWidth disabled={busy || email.trim() === '' || password === ''}>
           <span className="flex items-center justify-center gap-1">
             <Plus size={18} /> إضافة مدير
           </span>

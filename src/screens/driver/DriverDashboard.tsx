@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Check, CalendarClock, LogOut, MapPin, Navigation, Phone, RefreshCw, Wallet, Flag, Receipt, Gift, DollarSign } from 'lucide-react';
+import { Check, CalendarClock, LogOut, MapPin, Navigation, Phone, RefreshCw, Wallet, Flag, Receipt, Gift, DollarSign, Power, Handshake, Clock, Navigation2, X, User } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import { showInterstitialAd } from '@/lib/admob';
 import { WalletTopUpSection } from '@/screens/driver/WalletTopUpSection';
 import { formatDateTime, formatMoney, startOfCurrentMonthIso } from '@/lib/format';
-import { getSubscriptionPrice } from '@/lib/appSettings';
+import { getSubscriptionPrice, getRequiredMinBalance } from '@/lib/appSettings';
 import {
   completeTrip,
   findDriverByPhone,
@@ -15,10 +15,12 @@ import {
   listCompletedTripsSince,
   listWalletTransactions,
   renewDriverSubscription,
+  setDriverOnline,
   type Driver,
   type Trip,
   type WalletTransaction,
 } from '@/lib/api';
+import { useDriverGps, useIncomingRequests, requestNotificationPermission } from '@/hooks/useDriverDispatch';
 
 type TripBreakdown = {
   cashFromCustomer: number;
@@ -33,6 +35,7 @@ type Snapshot = {
   monthlyTrips: number;
   monthlyEarnings: number;
   subscriptionPrice: number;
+  requiredMinBalance: number;
   breakdowns: Record<string, TripBreakdown>;
 };
 
@@ -47,16 +50,33 @@ export function DriverDashboard({ driver, onLogout }: Props) {
   const [completingId, setCompletingId] = useState<string | null>(null);
   const [renewing, setRenewing] = useState(false);
   const [notice, setNotice] = useState<Notice>(null);
+  const [isOnline, setIsOnline] = useState(driver.isOnline);
+
+  const { currentPos, gpsError } = useDriverGps(driver.id, isOnline);
+  const [requiredMinBalance, setRequiredMinBalance] = useState(300);
+  const canReceiveRequests = hasActiveSubscription(driver) && driver.walletBalance >= requiredMinBalance;
+  const {
+    requests,
+    biddingTripId,
+    setBiddingTripId,
+    bidAmount,
+    setBidAmount,
+    submittingBid,
+    handleSubmitBid,
+    alertRequest,
+    dismissAlert,
+  } = useIncomingRequests(driver.id, isOnline, canReceiveRequests);
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
-      const [fresh, trips, ledger, monthly, subscriptionPrice] = await Promise.all([
+      const [fresh, trips, ledger, monthly, subscriptionPrice, requiredMinBalance] = await Promise.all([
         findDriverByPhone(driver.phone),
         listActiveTripsForDriver(driver.id),
         listWalletTransactions({ driverId: driver.id, limit: 20 }),
         listCompletedTripsSince(startOfCurrentMonthIso()),
         getSubscriptionPrice(),
+        getRequiredMinBalance(),
       ]);
       if (!fresh) {
         setLoadError('تعذر العثور على حسابك، حاول تسجيل الدخول مرة أخرى');
@@ -80,6 +100,7 @@ export function DriverDashboard({ driver, onLogout }: Props) {
         monthlyTrips: mine.length,
         monthlyEarnings: mine.reduce((sum, row) => sum + row.driverEarning, 0),
         subscriptionPrice,
+        requiredMinBalance,
         breakdowns,
       });
       setLoadError('');
@@ -95,6 +116,31 @@ export function DriverDashboard({ driver, onLogout }: Props) {
     const interval = setInterval(refresh, 10000);
     return () => clearInterval(interval);
   }, [refresh]);
+
+  const handleToggleOnline = async () => {
+    const next = !isOnline;
+    try {
+      await setDriverOnline(driver.id, next);
+      setIsOnline(next);
+      if (next) {
+        requestNotificationPermission();
+      } else {
+        setBiddingTripId(null);
+      }
+    } catch {
+      setNotice({ type: 'error', text: 'تعذر تغيير حالة الاتصال' });
+    }
+  };
+
+  const handleAcceptPrice = async (trip: Trip) => {
+    const amount = trip.suggestedFare ?? trip.clientOffer;
+    if (amount <= 0) {
+      setBiddingTripId(trip.id);
+      return;
+    }
+    await handleSubmitBid(trip.id, driver.id, amount);
+    setNotice({ type: 'success', text: `تم إرسال عرضك: ${formatMoney(amount)}` });
+  };
 
   const handleComplete = async (trip: Trip) => {
     setCompletingId(trip.id);
@@ -197,9 +243,50 @@ export function DriverDashboard({ driver, onLogout }: Props) {
       </div>
 
       {isSubscribed ? (
-        <div className="flex items-center gap-2 rounded-2xl bg-success-50 p-4 text-sm font-semibold text-success-600">
-          <Check size={18} /> اشتراكك فعال حتى {formatDateTime(current.subscriptionExpiresAt ?? '')} ويمكنك استقبال طلبات العملاء
-        </div>
+        <>
+          <div className="flex items-center gap-2 rounded-2xl bg-success-50 p-4 text-sm font-semibold text-success-600">
+            <Check size={18} /> اشتراكك فعال حتى {formatDateTime(current.subscriptionExpiresAt ?? '')}
+          </div>
+
+          <div className="rounded-2xl border-2 border-gray-200 bg-white p-4 shadow-sm">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <div className={`flex h-10 w-10 items-center justify-center rounded-xl ${isOnline ? 'bg-success-100' : 'bg-gray-100'}`}>
+                  <Power size={20} className={isOnline ? 'text-success-600' : 'text-gray-400'} />
+                </div>
+                <div>
+                  <p className="font-bold text-navy-800">{isOnline ? 'متصل الآن' : 'غير متصل'}</p>
+                  <p className="text-xs text-navy-400">{isOnline ? 'ستصلك طلبات العملاء القريبة' : 'فعّل الاتصال لاستقبال الطلبات'}</p>
+                </div>
+              </div>
+              <button
+                onClick={handleToggleOnline}
+                className={`relative h-8 w-14 rounded-full transition-colors ${isOnline ? 'bg-success-500' : 'bg-gray-300'}`}
+              >
+                <span className={`absolute top-1 h-6 w-6 rounded-full bg-white shadow transition-all ${isOnline ? 'left-1' : 'right-1'}`} />
+              </button>
+            </div>
+            {gpsError && isOnline && (
+              <p className="mt-3 rounded-lg bg-error-50 px-3 py-2 text-xs font-semibold text-error-600">{gpsError}</p>
+            )}
+            {isOnline && 'Notification' in window && Notification.permission !== 'granted' && (
+              <button
+                onClick={() => requestNotificationPermission()}
+                className="mt-3 flex w-full items-center justify-center gap-2 rounded-lg bg-brand-50 px-3 py-2 text-xs font-semibold text-brand-600 transition-colors hover:bg-brand-100"
+              >
+                فعّل إشعارات المتصفح لتصلك تنبيهات الطلبات حتى في الخلفية
+              </button>
+            )}
+            {isOnline && 'Notification' in window && Notification.permission === 'granted' && (
+              <p className="mt-2 text-center text-xs font-semibold text-success-500">إشعارات المتصفح مفعّلة</p>
+            )}
+            {isOnline && currentPos && (
+              <p className="mt-2 flex items-center gap-1 text-xs text-navy-400">
+                <Navigation2 size={12} /> موقعك الحالي: {currentPos.lat.toFixed(4)}, {currentPos.lng.toFixed(4)}
+              </p>
+            )}
+          </div>
+        </>
       ) : (
         <div className="space-y-3 rounded-2xl border-2 border-warning-400 bg-warning-50 p-4 animate-slide-up">
           <div className="flex items-start gap-3">
@@ -223,6 +310,98 @@ export function DriverDashboard({ driver, onLogout }: Props) {
           {current.walletBalance < subscriptionPrice && (
             <p className="text-center text-xs text-navy-500">اشحن محفظتك أولاً لتتمكن من تجديد الاشتراك</p>
           )}
+        </div>
+      )}
+
+      {isOnline && isSubscribed && requests.length > 0 && (
+        <div className="rounded-2xl border-2 border-brand-200 bg-brand-50 p-4 shadow-sm animate-slide-up">
+          <div className="mb-3 flex items-center gap-2">
+            <Handshake className="text-brand-500" size={20} />
+            <h3 className="font-bold text-navy-800">طلبات عملاء قريبة ({requests.length})</h3>
+          </div>
+          <div className="space-y-3">
+            {requests.map((req) => (
+              <div key={req.id} className="rounded-xl border-2 border-gray-100 bg-white p-3 animate-slide-in-right">
+                <div className="flex items-start justify-between">
+                  <div>
+                    <p className="font-bold text-navy-800">{req.clientName}</p>
+                    <a href={`tel:${req.clientPhone}`} className="flex items-center gap-1 text-sm text-brand-600">
+                      <Phone size={14} /> {req.clientPhone}
+                    </a>
+                  </div>
+                  {req.suggestedFare !== null && (
+                    <div className="text-left">
+                      <p className="text-xs text-navy-400">السعر المقترح</p>
+                      <p className="text-lg font-extrabold text-brand-600">{formatMoney(req.suggestedFare)}</p>
+                    </div>
+                  )}
+                </div>
+                <div className="mt-2 space-y-1 text-sm text-navy-600">
+                  <p className="flex items-center gap-1"><MapPin size={14} className="text-brand-500" /> من: {req.pickup}</p>
+                  <p className="flex items-center gap-1"><Navigation size={14} className="text-navy-500" /> إلى: {req.dropoff}</p>
+                  {req.distanceKm !== null && (
+                    <p className="flex items-center gap-1 text-navy-400"><Navigation2 size={12} /> المسافة: {req.distanceKm} كم</p>
+                  )}
+                  {req.clientOffer > 0 && (
+                    <p className="flex items-center gap-1"><DollarSign size={14} className="text-success-500" /> عرض العميل: {formatMoney(req.clientOffer)}</p>
+                  )}
+                </div>
+                {biddingTripId === req.id ? (
+                  <div className="mt-3 space-y-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        value={bidAmount}
+                        onChange={(e) => setBidAmount(e.target.value)}
+                        placeholder="اكتب سعرك"
+                        className="w-full rounded-xl border-2 border-gray-200 px-4 py-2 text-base text-navy-900 focus:border-brand-500 focus:outline-none"
+                      />
+                      <span className="text-sm text-navy-400">جنيه</span>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button
+                        variant="success"
+                        size="sm"
+                        className="flex-1"
+                        disabled={submittingBid || !bidAmount || Number(bidAmount) <= 0}
+                        onClick={() => handleSubmitBid(req.id, driver.id, Number(bidAmount))}
+                      >
+                        {submittingBid ? 'جاري الإرسال...' : 'إرسال العرض'}
+                      </Button>
+                      <Button variant="outline" size="sm" className="flex-1" onClick={() => { setBiddingTripId(null); setBidAmount(''); }}>
+                        إلغاء
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3 flex gap-2">
+                    {(req.suggestedFare ?? req.clientOffer) > 0 && (
+                      <Button variant="success" size="sm" className="flex-1" onClick={() => handleAcceptPrice(req)}>
+                        قبول السعر
+                      </Button>
+                    )}
+                    <Button
+                      variant={req.suggestedFare ? 'outline' : 'primary'}
+                      size="sm"
+                      className="flex-1"
+                      onClick={() => { setBiddingTripId(req.id); setBidAmount(String(req.suggestedFare ?? req.clientOffer ?? '')); }}
+                    >
+                      <span className="flex items-center justify-center gap-1">
+                        <Handshake size={16} /> عرض سعر
+                      </span>
+                    </Button>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isOnline && isSubscribed && requests.length === 0 && (
+        <div className="rounded-2xl bg-white p-5 text-center shadow-sm">
+          <Clock className="mx-auto text-navy-300" size={28} />
+          <p className="mt-2 text-sm text-navy-400">في انتظار طلبات العملاء القريبة...</p>
         </div>
       )}
 
@@ -351,12 +530,127 @@ export function DriverDashboard({ driver, onLogout }: Props) {
       </div>
 
       <button
-        onClick={onLogout}
+        onClick={() => {
+          if (isOnline) void setDriverOnline(driver.id, false);
+          onLogout();
+        }}
         className="flex w-full items-center justify-center gap-2 rounded-xl bg-navy-100 py-3 text-sm font-semibold text-navy-700 transition-colors hover:bg-navy-200"
       >
         <LogOut size={18} />
         تسجيل الخروج
       </button>
+
+      {alertRequest && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm animate-fade-in">
+          <div className="mx-6 w-full max-w-sm animate-pop rounded-3xl bg-white p-6 shadow-2xl">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-2">
+                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-brand-100">
+                  <Handshake className="text-brand-500" size={24} />
+                </div>
+                <div>
+                  <h3 className="text-lg font-extrabold text-navy-800">طلب جديد قريب منك!</h3>
+                  <p className="text-xs text-navy-400">عميل يطلب رحلة ضمن نطاقك</p>
+                </div>
+              </div>
+              <button
+                onClick={() => dismissAlert(alertRequest.id)}
+                className="rounded-lg p-1 text-navy-300 transition-colors hover:bg-gray-100 hover:text-navy-600"
+              >
+                <X size={20} />
+              </button>
+            </div>
+
+            <div className="mt-4 space-y-2 rounded-xl bg-gray-50 p-4">
+              <div className="flex items-center gap-2">
+                <User size={16} className="text-brand-500" />
+                <p className="font-bold text-navy-800">{alertRequest.clientName}</p>
+              </div>
+              <a href={`tel:${alertRequest.clientPhone}`} className="flex items-center gap-2 text-sm text-brand-600">
+                <Phone size={14} /> {alertRequest.clientPhone}
+              </a>
+              <p className="flex items-center gap-1 text-sm text-navy-600">
+                <MapPin size={14} className="text-brand-500" /> من: {alertRequest.pickup}
+              </p>
+              <p className="flex items-center gap-1 text-sm text-navy-600">
+                <Navigation size={14} className="text-navy-500" /> إلى: {alertRequest.dropoff}
+              </p>
+              {alertRequest.suggestedFare !== null && (
+                <p className="flex items-center gap-1 text-sm font-semibold text-navy-700">
+                  <DollarSign size={14} className="text-success-500" /> السعر المقترح: {formatMoney(alertRequest.suggestedFare)}
+                </p>
+              )}
+              {alertRequest.clientOffer > 0 && (
+                <p className="flex items-center gap-1 text-sm font-semibold text-navy-700">
+                  <DollarSign size={14} className="text-brand-500" /> عرض العميل: {formatMoney(alertRequest.clientOffer)}
+                </p>
+              )}
+            </div>
+
+            {biddingTripId === alertRequest.id ? (
+              <div className="mt-4 space-y-2">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    value={bidAmount}
+                    onChange={(e) => setBidAmount(e.target.value)}
+                    placeholder="اكتب سعرك"
+                    className="w-full rounded-xl border-2 border-gray-200 px-4 py-2 text-base text-navy-900 focus:border-brand-500 focus:outline-none"
+                  />
+                  <span className="text-sm text-navy-400">جنيه</span>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    variant="success"
+                    size="md"
+                    fullWidth
+                    disabled={submittingBid || !bidAmount || Number(bidAmount) <= 0}
+                    onClick={() => handleSubmitBid(alertRequest.id, driver.id, Number(bidAmount))}
+                  >
+                    {submittingBid ? 'جاري الإرسال...' : 'إرسال العرض'}
+                  </Button>
+                  <Button variant="outline" size="md" fullWidth onClick={() => { setBiddingTripId(null); setBidAmount(''); }}>
+                    إلغاء
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <div className="mt-4 flex gap-2">
+                {(alertRequest.suggestedFare ?? alertRequest.clientOffer) > 0 && (
+                  <Button
+                    variant="success"
+                    size="md"
+                    fullWidth
+                    onClick={() => handleAcceptPrice(alertRequest)}
+                  >
+                    قبول السعر
+                  </Button>
+                )}
+                <Button
+                  variant={alertRequest.suggestedFare ? 'outline' : 'primary'}
+                  size="md"
+                  fullWidth
+                  onClick={() => {
+                    setBiddingTripId(alertRequest.id);
+                    setBidAmount(String(alertRequest.suggestedFare ?? alertRequest.clientOffer ?? ''));
+                  }}
+                >
+                  <span className="flex items-center justify-center gap-1">
+                    <Handshake size={16} /> عرض سعر
+                  </span>
+                </Button>
+              </div>
+            )}
+
+            <button
+              onClick={() => dismissAlert(alertRequest.id)}
+              className="mt-3 w-full rounded-xl bg-error-50 py-2.5 text-sm font-semibold text-error-600 transition-colors hover:bg-error-100"
+            >
+              رفض الطلب
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

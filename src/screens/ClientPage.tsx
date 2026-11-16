@@ -12,27 +12,39 @@ import {
   Handshake,
   AlertCircle,
   Flag,
+  XCircle,
 } from 'lucide-react';
 import { useApp } from '@/context/AppContext';
 import { Button } from '@/components/ui/Button';
 import { TextField } from '@/components/ui/TextField';
+import { AddressAutocomplete } from '@/components/ui/AddressAutocomplete';
 import { SelectField } from '@/components/ui/SelectField';
 import { SupportTopBar } from '@/components/SupportTopBar';
 import { vehicleTypes } from '@/data/vehicles';
 import { egyptProvinces, provinceNames } from '@/data/egyptData';
-import { createTrip, getApiErrorMessage, listDispatchableDrivers, isCustomerNew } from '@/lib/api';
+import {
+  getApiErrorMessage,
+  isCustomerNew,
+  createPendingTrip,
+  cancelPendingTrip,
+  acceptBidAndAssignDriver,
+  listBidsForTrip,
+  getTripById,
+  type RideBid,
+} from '@/lib/api';
+import { supabase } from '@/lib/supabase';
 import { TripMap } from '@/components/trip/TripMap';
 import { usePricingSettings } from '@/hooks/usePricingSettings';
 import { useTripPlanner } from '@/hooks/useTripPlanner';
 
-type Bid = {
+type Phase = 'form' | 'searching' | 'enroute' | 'cancelled';
+
+type AcceptedBid = {
   id: string;
   driverName: string;
   vehicle: string;
   offer: number;
 };
-
-type Phase = 'form' | 'confirmed' | 'negotiating' | 'enroute';
 
 export function ClientPage() {
   const { setScreen, addClient, addNegotiation, addDispute } = useApp();
@@ -47,12 +59,16 @@ export function ClientPage() {
   const [negotiatedFare, setNegotiatedFare] = useState('');
   const [selectedVehicle, setSelectedVehicle] = useState('');
   const [phase, setPhase] = useState<Phase>('form');
-  const [bids, setBids] = useState<Bid[]>([]);
+  const [bids, setBids] = useState<RideBid[]>([]);
+  const [pendingTripId, setPendingTripId] = useState<string | null>(null);
+  const [acceptedBid, setAcceptedBid] = useState<AcceptedBid | null>(null);
   const [finalFare, setFinalFare] = useState<number | null>(null);
-  const [acceptedBid, setAcceptedBid] = useState<Bid | null>(null);
   const [showTripPopup, setShowTripPopup] = useState(false);
   const [toast, setToast] = useState('');
   const [isNewCustomer, setIsNewCustomer] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const bidChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const tripChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
 
   const formValid = Boolean(name.trim() && phone.trim());
   const locationValid = Boolean(pickup.trim() && dropoff.trim());
@@ -73,12 +89,9 @@ export function ClientPage() {
     pricing,
   });
   const distance = planner.route ? Math.round(planner.route.distanceKm * 10) / 10 : null;
-  const fareManuallyEdited = useRef(false);
 
   useEffect(() => {
-    if (planner.fare !== null && !fareManuallyEdited.current) {
-      setSuggestedFare(String(planner.fare));
-    }
+    setSuggestedFare(planner.fare !== null ? String(planner.fare) : '');
   }, [planner.fare]);
 
   useEffect(() => {
@@ -86,45 +99,83 @@ export function ClientPage() {
     isCustomerNew(phone.trim()).then(setIsNewCustomer).catch(() => setIsNewCustomer(false));
   }, [phone]);
 
+  // Clean up realtime channels on unmount
   useEffect(() => {
-    if (phase !== 'negotiating') return;
-    let cancelled = false;
-    let timer: ReturnType<typeof setInterval> | undefined;
+    return () => {
+      if (bidChannelRef.current) supabase.removeChannel(bidChannelRef.current);
+      if (tripChannelRef.current) supabase.removeChannel(tripChannelRef.current);
+    };
+  }, []);
 
-    listDispatchableDrivers()
-      .then((drivers) => {
-        if (cancelled) return;
-        const offering = drivers.slice(0, 3);
-        if (offering.length === 0) {
-          showToast('لا يوجد كباتن متاحين الآن');
-          return;
-        }
-        let index = 0;
-        timer = setInterval(() => {
-          const driver = offering[index];
-          index += 1;
-          if (index >= offering.length) clearInterval(timer);
-          const base = parseInt(negotiatedFare) || parseInt(suggestedFare) || 50;
-          setBids((prev) => [
-            ...prev,
-            {
-              id: driver.id,
-              driverName: driver.name,
-              vehicle: driver.vehicleType,
-              offer: base + Math.floor(Math.random() * 30) + 5,
-            },
-          ]);
-        }, 1500);
+  // Subscribe to real-time bids when searching
+  useEffect(() => {
+    if (phase !== 'searching' || !pendingTripId) return;
+
+    // Initial fetch of existing bids
+    listBidsForTrip(pendingTripId).then(setBids).catch(() => {});
+
+    const channel = supabase
+      .channel(`ride-bids-${pendingTripId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'ride_bids' }, (payload) => {
+        const newRow = payload.new as { trip_id: string; status: string };
+        if (newRow.trip_id !== pendingTripId) return;
+        listBidsForTrip(pendingTripId).then(setBids).catch(() => {});
       })
-      .catch((error) => {
-        if (!cancelled) showToast(getApiErrorMessage(error, 'تعذر تحميل عروض الكباتن، حاول مرة أخرى'));
-      });
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'ride_bids' }, (payload) => {
+        const newRow = payload.new as { trip_id: string; status: string };
+        if (newRow.trip_id !== pendingTripId) return;
+        listBidsForTrip(pendingTripId).then(setBids).catch(() => {});
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'trips' }, (payload) => {
+        const newRow = payload.new as { id: string; status: string };
+        if (newRow.id !== pendingTripId) return;
+        if (newRow.status === 'cancelled') {
+          setPhase('cancelled');
+          if (bidChannelRef.current) supabase.removeChannel(bidChannelRef.current);
+        }
+      })
+      .subscribe();
+
+    bidChannelRef.current = channel;
 
     return () => {
-      cancelled = true;
-      clearInterval(timer);
+      supabase.removeChannel(channel);
+      bidChannelRef.current = null;
     };
-  }, [phase, suggestedFare, negotiatedFare]);
+  }, [phase, pendingTripId]);
+
+  // Monitor trip status when enroute
+  useEffect(() => {
+    if (phase !== 'enroute' || !pendingTripId) return;
+
+    const channel = supabase
+      .channel(`trip-status-${pendingTripId}`)
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'trips' }, (payload) => {
+        const newRow = payload.new as { id: string; status: string };
+        if (newRow.id !== pendingTripId) return;
+        if (newRow.status === 'completed') {
+          setShowTripPopup(true);
+        }
+      })
+      .subscribe();
+
+    tripChannelRef.current = channel;
+
+    // Also poll as fallback in case realtime misses
+    const interval = setInterval(async () => {
+      const trip = await getTripById(pendingTripId).catch(() => null);
+      if (trip?.status === 'completed') {
+        setShowTripPopup(true);
+        clearInterval(interval);
+      }
+    }, 10000);
+
+    return () => {
+      supabase.removeChannel(channel);
+      tripChannelRef.current = null;
+      clearInterval(interval);
+    };
+  }, [phase, pendingTripId]);
 
   const ADMIN_SECRET_CODE = '*#1234#';
 
@@ -143,21 +194,19 @@ export function ClientPage() {
     setTimeout(() => setToast(''), 3000);
   };
 
-  const handleConfirm = () => {
+  const handleConfirm = async () => {
     if (!formValid || !province || !city || !locationValid || !selectedVehicle) return;
+    if (!planner.pickupPoint) {
+      showToast('حدد مكان الركوب على الخريطة أولاً');
+      return;
+    }
+
     addClient({ name, phone, province, city });
-    setPhase('confirmed');
-    showToast('اجهز إحنا في الطريق');
-    setTimeout(() => setPhase('negotiating'), 2000);
-  };
+    const clientOffer = parseInt(negotiatedFare) || parseInt(suggestedFare) || 0;
+    const suggestedFareNum = planner.fare;
 
-  const clientOffer = parseInt(negotiatedFare) || parseInt(suggestedFare) || 0;
-
-  const handleAcceptBid = async (bid: Bid) => {
-    const fare = bid.offer;
     try {
-      await createTrip({
-        driverId: bid.id,
+      const tripId = await createPendingTrip({
         clientName: name.trim(),
         clientPhone: phone.trim(),
         province,
@@ -166,36 +215,93 @@ export function ClientPage() {
         dropoff: dropoff.trim(),
         distanceKm: distance,
         clientOffer,
-        finalFare: fare,
+        suggestedFare: suggestedFareNum,
+        pickupLat: planner.pickupPoint.lat,
+        pickupLng: planner.pickupPoint.lng,
+        vehicleType: selectedVehicle,
       });
+      setPendingTripId(tripId);
+      setPhase('searching');
+      showToast('تم إرسال طلبك للكباتن القريبين');
     } catch (error) {
-      showToast(getApiErrorMessage(error, 'تعذر حفظ الرحلة، حاول مرة أخرى'));
+      console.error('[ClientPage handleConfirm] Failed to create pending trip:', {
+        error,
+        payload: {
+          clientName: name.trim(),
+          clientPhone: phone.trim(),
+          province,
+          city,
+          pickup: pickup.trim(),
+          dropoff: dropoff.trim(),
+          distanceKm: distance,
+          clientOffer,
+          suggestedFare: suggestedFareNum,
+          pickupLat: planner.pickupPoint?.lat ?? null,
+          pickupLng: planner.pickupPoint?.lng ?? null,
+          vehicleType: selectedVehicle,
+        },
+      });
+      showToast(getApiErrorMessage(error, 'تعذر إرسال الطلب، حاول مرة أخرى'));
+    }
+  };
+
+  const handleCancelSearch = async () => {
+    if (!pendingTripId) return;
+    setCancelling(true);
+    try {
+      await cancelPendingTrip(pendingTripId);
+      if (bidChannelRef.current) {
+        supabase.removeChannel(bidChannelRef.current);
+        bidChannelRef.current = null;
+      }
+      setPhase('cancelled');
+      setPendingTripId(null);
+      setBids([]);
+    } catch {
+      showToast('تعذر إلغاء الطلب');
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  const handleRestartFromCancelled = () => {
+    setPhase('form');
+    setBids([]);
+    setPendingTripId(null);
+  };
+
+  const handleAcceptBid = async (bid: RideBid) => {
+    if (!pendingTripId) return;
+    const fare = bid.offerAmount;
+    try {
+      await acceptBidAndAssignDriver(pendingTripId, bid.id, bid.driverId, fare);
+    } catch (error) {
+      showToast(getApiErrorMessage(error, 'تعذر تأكيد قبول العرض، حاول مرة أخرى'));
       return;
     }
+    if (bidChannelRef.current) {
+      supabase.removeChannel(bidChannelRef.current);
+      bidChannelRef.current = null;
+    }
     setFinalFare(fare);
-    setAcceptedBid(bid);
+    setAcceptedBid({
+      id: bid.id,
+      driverName: bid.driverName,
+      vehicle: bid.vehicleType,
+      offer: fare,
+    });
     const cashToPay = isNewCustomer ? Math.round(fare / 2) : fare;
     setCashPayable(cashToPay);
     addNegotiation({
       clientName: name,
       driverName: bid.driverName,
-      clientOffer,
-      driverOffer: bid.offer,
+      clientOffer: parseInt(negotiatedFare) || parseInt(suggestedFare) || 0,
+      driverOffer: bid.offerAmount,
       finalFare: fare,
       status: 'agreed',
     });
     showToast(`تم الاتفاق على مبلغ ${fare} جنيه`);
     setPhase('enroute');
-    setTimeout(() => setShowTripPopup(true), 4000);
-  };
-
-  const handleCounterBid = (bid: Bid) => {
-    const counter = Math.round((clientOffer + bid.offer) / 2);
-    const updated = bids.map((b) =>
-      b.id === bid.id ? { ...b, offer: counter } : b,
-    );
-    setBids(updated);
-    showToast(`تمت مراجعة العرض: ${counter} جنيه`);
   };
 
   const [cashPayable, setCashPayable] = useState<number | null>(null);
@@ -220,7 +326,13 @@ export function ClientPage() {
       <div className="sticky top-0 z-30 bg-gradient-to-l from-navy-800 to-navy-900 px-4 py-3 shadow-lg">
         <div className="flex items-center justify-between">
           <button
-            onClick={() => setScreen('role')}
+            onClick={() => {
+              if (phase === 'searching' && pendingTripId) {
+                void handleCancelSearch();
+              } else {
+                setScreen('role');
+              }
+            }}
             className="flex items-center gap-1 text-white/80 transition-colors hover:text-white"
           >
             <ArrowRight size={20} />
@@ -295,18 +407,20 @@ export function ClientPage() {
                   تفاصيل الرحلة
                 </h3>
                 <div className="space-y-3">
-                  <TextField
+                  <AddressAutocomplete
                     label="مكان الركوب"
                     placeholder="اكتب مكان الركوب"
                     value={pickup}
-                    onChange={(e) => setPickup(e.target.value)}
+                    onChange={setPickup}
+                    onSuggestionSelect={(s) => planner.setPointFromSuggestion('pickup', s)}
                     icon={<MapPin size={18} />}
                   />
-                  <TextField
+                  <AddressAutocomplete
                     label="مكان الوصول"
                     placeholder="اكتب مكان الوصول"
                     value={dropoff}
-                    onChange={(e) => setDropoff(e.target.value)}
+                    onChange={setDropoff}
+                    onSuggestionSelect={(s) => planner.setPointFromSuggestion('dropoff', s)}
                     icon={<Navigation size={18} />}
                   />
                 <div className="grid grid-cols-2 gap-3">
@@ -314,15 +428,12 @@ export function ClientPage() {
                     label="المبلغ المقترح (جنيه)"
                     placeholder="تلقائي"
                     type="number"
+                    readOnly
                     value={suggestedFare}
-                    onChange={(e) => {
-                      fareManuallyEdited.current = true;
-                      setSuggestedFare(e.target.value);
-                    }}
                     icon={<DollarSign size={18} />}
                   />
                   <TextField
-                    label="تفاوض السعر (جنيه)"
+                    label="عرض السعر (جنيه)"
                     placeholder="اكتب سعر مختلف"
                     type="number"
                     value={negotiatedFare}
@@ -330,11 +441,6 @@ export function ClientPage() {
                     icon={<Handshake size={18} />}
                   />
                 </div>
-                {planner.fare !== null && (
-                  <p className="text-xs text-navy-400">
-                    السعر المحسوب من المسافة: {planner.fare} جنيه — تقدر تعدله أو تفاوض على سعر مختلف
-                  </p>
-                )}
                 </div>
               </div>
             )}
@@ -409,31 +515,22 @@ export function ClientPage() {
           </div>
         )}
 
-        {phase === 'confirmed' && (
-          <div className="flex flex-col items-center justify-center py-20 animate-scale-in">
-            <div className="flex h-24 w-24 items-center justify-center rounded-full bg-success-500 shadow-xl shadow-success-500/30">
-              <CheckCircle2 className="text-white" size={48} />
-            </div>
-            <h2 className="mt-6 text-2xl font-extrabold text-navy-800">جهز إحنا في الطريق</h2>
-            <p className="mt-2 text-navy-500">جاري البحث عن كابتن قريب منك...</p>
-            <div className="mt-6 flex gap-2">
-              {[0, 1, 2].map((i) => (
-                <div
-                  key={i}
-                  className="h-3 w-3 rounded-full bg-brand-500"
-                  style={{ animation: `bounceSmall 1s ease-in-out ${i * 0.2}s infinite` }}
-                />
-              ))}
-            </div>
-          </div>
-        )}
-
-        {phase === 'negotiating' && (
+        {phase === 'searching' && (
           <div className="space-y-4 animate-fade-in">
             <div className="rounded-2xl bg-white p-5 shadow-sm">
-              <div className="mb-4 flex items-center gap-2">
-                <Handshake className="text-brand-500" size={24} />
-                <h2 className="text-xl font-extrabold text-navy-800">التفاوض على السعر</h2>
+              <div className="mb-4 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Handshake className="text-brand-500" size={24} />
+                  <h2 className="text-xl font-extrabold text-navy-800">في انتظار عروض الكباتن</h2>
+                </div>
+                <button
+                  onClick={handleCancelSearch}
+                  disabled={cancelling}
+                  className="flex items-center gap-1 rounded-lg bg-error-50 px-3 py-1.5 text-sm font-semibold text-error-600 transition-colors hover:bg-error-100"
+                >
+                  <XCircle size={16} />
+                  {cancelling ? '...' : 'إلغاء'}
+                </button>
               </div>
 
               <div className="mb-4 grid grid-cols-2 gap-3">
@@ -453,7 +550,7 @@ export function ClientPage() {
                 {bids.length === 0 && (
                   <div className="flex flex-col items-center py-6 text-navy-400">
                     <Clock className="animate-pulse-soft" size={32} />
-                    <p className="mt-2 text-sm">في انتظار عروض الكابتن...</p>
+                    <p className="mt-2 text-sm">جاري البحث عن كباتن قريبين منك...</p>
                   </div>
                 )}
                 {bids.map((bid) => (
@@ -464,19 +561,16 @@ export function ClientPage() {
                     <div className="flex items-center justify-between">
                       <div>
                         <p className="font-bold text-navy-800">{bid.driverName}</p>
-                        <p className="text-xs text-navy-400">{bid.vehicle}</p>
+                        <p className="text-xs text-navy-400">{bid.vehicleType}</p>
                       </div>
                       <div className="text-left">
-                        <p className="text-2xl font-extrabold text-brand-600">{bid.offer}</p>
+                        <p className="text-2xl font-extrabold text-brand-600">{bid.offerAmount}</p>
                         <p className="text-xs text-navy-400">جنيه</p>
                       </div>
                     </div>
                     <div className="mt-3 flex gap-2">
                       <Button variant="success" size="sm" className="flex-1" onClick={() => handleAcceptBid(bid)}>
                         قبول
-                      </Button>
-                      <Button variant="outline" size="sm" className="flex-1" onClick={() => handleCounterBid(bid)}>
-                        مراجعة السعر
                       </Button>
                     </div>
                   </div>
@@ -491,6 +585,19 @@ export function ClientPage() {
               <Flag size={18} />
               الإبلاغ عن مشكلة
             </button>
+          </div>
+        )}
+
+        {phase === 'cancelled' && (
+          <div className="flex flex-col items-center justify-center py-20 animate-scale-in">
+            <div className="flex h-24 w-24 items-center justify-center rounded-full bg-error-100 shadow-xl">
+              <XCircle className="text-error-500" size={48} />
+            </div>
+            <h2 className="mt-6 text-2xl font-extrabold text-navy-800">تم إلغاء الطلب</h2>
+            <p className="mt-2 text-navy-500">يمكنك إرسال طلب جديد في أي وقت</p>
+            <Button variant="primary" size="md" className="mt-6" onClick={handleRestartFromCancelled}>
+              طلب جديد
+            </Button>
           </div>
         )}
 

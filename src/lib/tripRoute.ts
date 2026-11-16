@@ -8,13 +8,73 @@ export type RouteSummary = {
   polyline: [number, number][];
 };
 
+// Photon API (komoot.io) — faster, more accurate for Egyptian locations
+const PHOTON_BASE = 'https://photon.komoot.io/api';
+const EGYPT_LAT = 26.8;
+const EGYPT_LON = 30.8;
+const EGYPT_BIAS_SCALE = 0.1; // strong bias toward Egypt
+
+type PhotonFeature = {
+  geometry: { coordinates: [number, number] };
+  properties: {
+    name?: string;
+    city?: string;
+    street?: string;
+    state?: string;
+    country?: string;
+    postcode?: string;
+    osm_value?: string;
+  };
+};
+
+function formatPhotonFeature(f: PhotonFeature): string {
+  const p = f.properties;
+  const parts = [p.name, p.street, p.city, p.state, p.country].filter(Boolean);
+  return parts.join('، ') || p.name || 'موقع غير معروف';
+}
+
+function photonFeatureToSuggestion(f: PhotonFeature): AddressSuggestion {
+  const [lng, lat] = f.geometry.coordinates;
+  return {
+    displayName: formatPhotonFeature(f),
+    lat,
+    lng,
+  };
+}
+
 export async function geocodeAddress(address: string): Promise<LatLng | null> {
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&countrycodes=eg&limit=1`;
-  const res = await fetch(url, { headers: { 'Accept-Language': 'ar' } });
-  if (!res.ok) return null;
-  const data = (await res.json()) as Array<{ lat: string; lon: string }>;
-  if (data.length === 0) return null;
-  return { lat: parseFloat(data[0].lat), lng: parseFloat(data[0].lon) };
+  if (address.trim().length < 3) return null;
+  const url = `${PHOTON_BASE}/?q=${encodeURIComponent(address)}&lat=${EGYPT_LAT}&lon=${EGYPT_LON}&lang=ar&limit=1`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = (await res.json()) as { features?: PhotonFeature[] };
+    const feature = data.features?.[0];
+    if (!feature) return null;
+    const [lng, lat] = feature.geometry.coordinates;
+    return { lat, lng };
+  } catch {
+    return null;
+  }
+}
+
+export type AddressSuggestion = {
+  displayName: string;
+  lat: number;
+  lng: number;
+};
+
+export async function searchAddresses(query: string): Promise<AddressSuggestion[]> {
+  if (query.trim().length < 3) return [];
+  const url = `${PHOTON_BASE}/?q=${encodeURIComponent(query)}&lat=${EGYPT_LAT}&lon=${EGYPT_LON}&lang=ar&limit=8`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return [];
+    const data = (await res.json()) as { features?: PhotonFeature[] };
+    return (data.features ?? []).map(photonFeatureToSuggestion);
+  } catch {
+    return [];
+  }
 }
 
 export async function reverseGeocode(point: LatLng): Promise<string | null> {
